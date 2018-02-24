@@ -56,10 +56,14 @@
 #define PIN_LED  0x80
 #define CONTROLBUS_BITMASK 0xBF /* 0b1011 1111 = 0xBF */
 
+#define STATUSREG_IO0  0x01
+
 #define REALWORLD_DELAY 10 /* 10 usec */
 
 const unsigned char CMD_READID = 0x90; /* read ID register */
 const unsigned char CMD_READ1[2] = { 0x00, 0x30 }; /* page read */
+const unsigned char CMD_BLOCKERASE[2] = { 0x60, 0xD0 }; /* block erase */
+const unsigned char CMD_READSTATUS = 0x70; /* read status */
 
 typedef enum { OFF=0, ON=1 } onoff_t;
 typedef enum { IOBUS_IN=0, IOBUS_OUT=1 } iobus_inout_t;
@@ -366,11 +370,15 @@ int latch_command(unsigned char command)
     return 0;
 }
 
-/* "Address Input bus operation allows the insertion of the memory address. Five cycles are required to input the addresses
-for the 4Gbit devices. Addresses are accepted with Chip Enable low, Address Latch Enable High, Command Latch Enable
-low and Read Enable High and latched on the rising edge of Write Enable. Moreover for commands that starts a modify-
-ing operation (write/erase) the Write Protect pin must be high. See Figure 5 and Table 13 for details of the timings
-requirements. Addresses are always applied on IO7:0 regardless of the bus configuration (x8 or x16)."" */
+/** 
+ * "Address Input bus operation allows the insertion of the memory address. 
+ * Five cycles are required to input the addresses for the 4Gbit devices. 
+ * Addresses are accepted with Chip Enable low, Address Latch Enable High, Command Latch Enable low and 
+ * Read Enable High and latched on the rising edge of Write Enable.
+ * Moreover for commands that starts a modifying operation (write/erase) the Write Protect pin must be high. 
+ * See Figure 5 and Table 13 for details of the timings requirements.
+ * Addresses are always applied on IO7:0 regardless of the bus configuration (x8 or x16).""
+ */
 int latch_address(unsigned char address[], unsigned int addr_length)
 {
     unsigned int addr_idx = 0;
@@ -509,21 +517,209 @@ void get_address_cycle_map_x8(uint32_t mem_address, unsigned char* addr_cylces)
     addr_cylces[4] = (unsigned char)( (mem_address & 0x30000000) >> 28 );
 }
 
+void dump_memory(void)
+{
+    FILE *fp;
+    unsigned int page_idx;
+    unsigned int page_idx_max;
+    unsigned char addr_cylces[5];
+    uint32_t mem_address;
+    unsigned char mem_large_block[2112]; /* page content */
+    //    unsigned int byte_offset;
+    //    unsigned int line_no;
+
+    printf("Trying to open file for storing the binary dump...\n");
+    /* Opens a text file for both reading and writing. It first truncates the file to zero length
+     * if it exists, otherwise creates a file if it does not exist. */
+    fp = fopen("flashdump.bin", "w+");
+
+    if( fp == NULL )
+        printf("  Error when opening the file...\n");
+    else
+        printf("  File opened successfully...\n");
+
+    // Start reading the data
+    mem_address = 0x00000000; // start address
+    page_idx_max = 64 * 4096;
+    for( page_idx = 0; page_idx < page_idx_max; /* blocks per page * overall blocks */ page_idx++)
+    {
+
+      printf("Reading data from page %d / %d (%.2f %%)\n", page_idx, page_idx_max, (float)page_idx/(float)page_idx_max * 100 );
+      {
+          printf("Reading data from memory address 0x%02X\n", mem_address);
+          get_address_cycle_map_x8(mem_address, addr_cylces);
+          printf("  Address cycles are: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+              addr_cylces[0], addr_cylces[1], /* column address */
+              addr_cylces[2], addr_cylces[3], addr_cylces[4] ); /* row address */
+
+          printf("Latching first command byte to read a page...\n");
+          latch_command(CMD_READ1[0]);
+
+          printf("Latching address cycles...\n");
+          latch_address(addr_cylces, 5);
+
+          printf("Latching second command byte to read a page...\n");
+          latch_command(CMD_READ1[1]);
+
+          // busy-wait for high level at the busy line
+          printf("Checking for busy line...\n");
+          unsigned char controlbus_val;
+          do
+          {
+              controlbus_val = controlbus_read_input();
+          }
+          while( !(controlbus_val & PIN_RDY) );
+
+          printf("  done\n");
+
+          printf("Latching out data block...\n");
+          latch_register(mem_large_block, 2112);
+      }
+
+//      // Dumping memory to console and file
+//      // 2112 bytes = 132 lines * 16 bytes/line
+//      for( line_no = 0; line_no < 132; line_no++ )
+//      {
+//          byte_offset = line_no * 16;
+//
+//          // Dumping memory to console
+//          // printf("%02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X | ",
+//          //     mem_large_block[byte_offset+0], mem_large_block[byte_offset+1],
+//          //     mem_large_block[byte_offset+2], mem_large_block[byte_offset+3],
+//          //     mem_large_block[byte_offset+4], mem_large_block[byte_offset+5],
+//          //     mem_large_block[byte_offset+6], mem_large_block[byte_offset+7],
+//          //     mem_large_block[byte_offset+8], mem_large_block[byte_offset+9],
+//          //     mem_large_block[byte_offset+10], mem_large_block[byte_offset+11],
+//          //     mem_large_block[byte_offset+12], mem_large_block[byte_offset+13],
+//          //     mem_large_block[byte_offset+14], mem_large_block[byte_offset+15] );
+//
+//          // for( k = 0; k < 16; k++ )
+//          // {
+//          //   c = mem_large_block[byte_offset+k];
+//          //   if( c >= 0x20u && c <= 0x7Fu)
+//          //     printf("%c", c);
+//          //   else
+//          //     printf("_");
+//          // }
+//          // printf("\n");
+//      }
+
+      // Dumping memory to file
+      //printf("Dumping binary data to file...\n");
+      fwrite(&mem_large_block[0], 1, 2112, fp);
+
+      mem_address += 2112; // add bytes per block (i.e. goto next block)
+    }
+
+    // Finished reading the data
+    printf("Closing binary dump file...\n");
+
+    fclose(fp);
+}
+
+/**
+ * BlockErase
+ *
+ * "The Erase operation is done on a block basis.
+ * Block address loading is accomplished in there cycles initiated by an Erase Setup command (60h).
+ * Only address A18 to A29 is valid while A12 to A17 is ignored (x8).
+ *
+ * The Erase Confirm command (D0h) following the block address loading initiates the internal erasing process.
+ * This two step sequence of setup followed by execution command ensures that memory contents are not
+ * accidentally erased due to external noise conditions.
+ *
+ * At the rising edge of WE after the erase confirm command input,
+ * the internal write controller handles erase and erase verify.
+ *
+ * Once the erase process starts, the Read Status Register command may be entered to read the status register.
+ * The system controller can detect the completion of an erase by monitoring the R/B output,
+ * or the Status bit (I/O 6) of the Status Register.
+ * Only the Read Status command and Reset command are valid while erasing is in progress.
+ * When the erase operation is completed, the Write Status Bit (I/O 0) may be checked."
+ */
+int erase_block(unsigned int nBlockId)
+{
+	uint32_t mem_address;
+	unsigned char addr_cylces[5];
+
+	/* calculate memory address */
+	mem_address = 2048 * 64 * nBlockId; // (2K + 64) bytes x 64 pages per block
+
+	/* remove write protection */
+	controlbus_pin_set(PIN_nWP, ON);
+
+	printf("Latching first command byte to erase a block...\n");
+	latch_command(CMD_BLOCKERASE[0]); /* block erase setup command */
+
+	printf("Erasing block of data from memory address 0x%02X\n", mem_address);
+	get_address_cycle_map_x8(mem_address, addr_cylces);
+	printf("  Address cycles are (but: will take only cycles 3..5) : 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+		addr_cylces[0], addr_cylces[1], /* column address */
+		addr_cylces[2], addr_cylces[3], addr_cylces[4] ); /* row address */
+
+	printf("Latching page(row) address (3 bytes)...\n");
+	unsigned char address[] = { addr_cylces[2], addr_cylces[3], addr_cylces[4] };
+	latch_address(address, 3);
+
+	printf("Latching second command byte to erase a block...\n");
+	latch_command(CMD_BLOCKERASE[1]);
+
+	/* tWB: WE High to Busy is 100 ns -> ignore it here as it takes some time for the next command to execute */
+
+	// busy-wait for high level at the busy line
+	printf("Checking for busy line...\n");
+	unsigned char controlbus_val;
+	do
+	{
+		controlbus_val = controlbus_read_input();
+	}
+	while( !(controlbus_val & PIN_RDY) );
+
+	printf("  done\n");
+
+
+	/* Read status */
+
+	printf("Latching command byte to read status...\n");
+	latch_command(CMD_READSTATUS);
+
+	unsigned char status_register;
+	latch_register(&status_register, 1); /* data output operation */
+
+	/* output the retrieved status register content */
+	printf("Status register content:   0x%02X\n", status_register);
+
+
+	/* activate write protection again */
+	controlbus_pin_set(PIN_nWP, OFF);
+
+
+	if(status_register & STATUSREG_IO0)
+	{
+		fprintf(stderr, "Failed to erase block.\n");
+		return 1;
+	}
+	else
+	{
+		printf("Successfully erased block.\n");
+		return 0;
+	}
+}
+
+/**
+ * Page Program
+ *
+ */
+void program_page(void)
+{
+}
+
+
 int main(int argc, char **argv)
 {
     struct ftdi_version_info version;
     unsigned char ID_register[5];
-    unsigned char addr_cylces[5];
-    unsigned char mem_large_block[2112]; /* page */
-    unsigned char c;
     int f;
-    unsigned int page_idx;
-    unsigned int page_idx_max;
-    unsigned int line_no;
-    unsigned int byte_offset;
-    unsigned int k;
-    uint32_t mem_address;
-    FILE *fp;
 
     // show library version
     version = ftdi_get_library_version();
@@ -623,92 +819,16 @@ int main(int argc, char **argv)
         check_ID_register(ID_register);
     }
 
-    printf("Trying to open file for storing the binary dump...\n");
-    /* Opens a text file for both reading and writing. It first truncates the file to zero length 
-     * if it exists, otherwise creates a file if it does not exist. */
-    fp = fopen("flashdump.bin", "w+");
+    dump_memory();
 
-    if( fp == NULL )
-        printf("  Error when opening the file...\n");
-    else
-        printf("  File opened successfully...\n");
+//	/* Erase all blocks */
+//    for( unsigned int nBlockId = 0; nBlockId < 4096; nBlockId++ )
+//    {
+//    	erase_block(nBlockId);
+//    }
 
-    // Start reading the data
-    mem_address = 0x00000000; // start address
-    page_idx_max = 64 * 4096;
-    for( page_idx = 0; page_idx < page_idx_max; /* blocks per page * overall blocks */ page_idx++)
-    {
+//    program_page();
 
-      printf("Reading data from page %d / %d (%.2f %%)\n", page_idx, page_idx_max, (float)page_idx/(float)page_idx_max * 100 );
-      {
-          printf("Reading data from memory address 0x%02X\n", mem_address);
-          get_address_cycle_map_x8(mem_address, addr_cylces);
-          printf("  Address cycles are: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
-              addr_cylces[0], addr_cylces[1], /* column address */
-              addr_cylces[2], addr_cylces[3], addr_cylces[4] ); /* row address */
-
-          printf("Latching first command byte to read a page...\n");
-          latch_command(CMD_READ1[0]);
-          
-          printf("Latching address cycles...\n");
-          latch_address(addr_cylces, 5);
-
-          printf("Latching second command byte to read a page...\n");
-          latch_command(CMD_READ1[1]);
-
-          // busy-wait for high level at the busy line
-          printf("Checking for busy line...\n");
-          unsigned char controlbus_val;
-          do
-          {
-              controlbus_val = controlbus_read_input();
-          }
-          while( !(controlbus_val & PIN_RDY) );
-
-          printf("  done\n");
-
-          printf("Latching out data block...\n");
-          latch_register(mem_large_block, 2112);
-      }
-      
-      // Dumping memory to console and file
-      // 2112 bytes = 132 lines * 16 bytes/line
-      for( line_no = 0; line_no < 132; line_no++ )
-      {
-          byte_offset = line_no * 16;
-
-          // Dumping memory to console
-          // printf("%02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X | ",
-          //     mem_large_block[byte_offset+0], mem_large_block[byte_offset+1],
-          //     mem_large_block[byte_offset+2], mem_large_block[byte_offset+3],
-          //     mem_large_block[byte_offset+4], mem_large_block[byte_offset+5],
-          //     mem_large_block[byte_offset+6], mem_large_block[byte_offset+7],
-          //     mem_large_block[byte_offset+8], mem_large_block[byte_offset+9],
-          //     mem_large_block[byte_offset+10], mem_large_block[byte_offset+11],
-          //     mem_large_block[byte_offset+12], mem_large_block[byte_offset+13],
-          //     mem_large_block[byte_offset+14], mem_large_block[byte_offset+15] );
-
-          // for( k = 0; k < 16; k++ )
-          // {
-          //   c = mem_large_block[byte_offset+k];
-          //   if( c >= 0x20u && c <= 0x7Fu)
-          //     printf("%c", c);
-          //   else
-          //     printf("_");
-          // }
-          // printf("\n");
-      }
-
-      // Dumping memory to file
-      //printf("Dumping binary data to file...\n");
-      fwrite(&mem_large_block[0], 1, 2112, fp);
-
-      mem_address += 2112; // add bytes per block (i.e. goto next block)
-    }
-
-    // Finished reading the data
-    printf("Closing binary dump file...\n");
-    fclose(fp);
 
     // set nCE high
     controlbus_pin_set(PIN_nCE, ON);
