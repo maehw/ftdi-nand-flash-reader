@@ -60,10 +60,14 @@
 
 #define REALWORLD_DELAY 10 /* 10 usec */
 
+#define PAGE_SIZE 2112
+#define PAGE_SIZE_NOSPARE 2048
+
 const unsigned char CMD_READID = 0x90; /* read ID register */
 const unsigned char CMD_READ1[2] = { 0x00, 0x30 }; /* page read */
 const unsigned char CMD_BLOCKERASE[2] = { 0x60, 0xD0 }; /* block erase */
 const unsigned char CMD_READSTATUS = 0x70; /* read status */
+const unsigned char CMD_PAGEPROGRAM[2] = { 0x80, 0x10 }; /* program page */
 
 typedef enum { OFF=0, ON=1 } onoff_t;
 typedef enum { IOBUS_IN=0, IOBUS_OUT=1 } iobus_inout_t;
@@ -524,7 +528,7 @@ void dump_memory(void)
     unsigned int page_idx_max;
     unsigned char addr_cylces[5];
     uint32_t mem_address;
-    unsigned char mem_large_block[2112]; /* page content */
+    unsigned char mem_large_block[PAGE_SIZE]; /* page content */
     //    unsigned int byte_offset;
     //    unsigned int line_no;
 
@@ -573,7 +577,7 @@ void dump_memory(void)
           printf("  done\n");
 
           printf("Latching out data block...\n");
-          latch_register(mem_large_block, 2112);
+          latch_register(mem_large_block, PAGE_SIZE);
       }
 
 //      // Dumping memory to console and file
@@ -606,9 +610,9 @@ void dump_memory(void)
 
       // Dumping memory to file
       //printf("Dumping binary data to file...\n");
-      fwrite(&mem_large_block[0], 1, 2112, fp);
+      fwrite(&mem_large_block[0], 1, PAGE_SIZE, fp);
 
-      mem_address += 2112; // add bytes per block (i.e. goto next block)
+      mem_address += PAGE_SIZE; // add bytes per block (i.e. goto next block)
     }
 
     // Finished reading the data
@@ -679,7 +683,6 @@ int erase_block(unsigned int nBlockId)
 
 
 	/* Read status */
-
 	printf("Latching command byte to read status...\n");
 	latch_command(CMD_READSTATUS);
 
@@ -706,14 +709,172 @@ int erase_block(unsigned int nBlockId)
 	}
 }
 
+
+int latch_data_out(unsigned char data[], unsigned int length)
+{
+//	printf("\n");
+
+    for(unsigned int k = 0; k < length; k++)
+    {
+        // toggle nWE low
+        controlbus_pin_set(PIN_nWE, OFF);
+        controlbus_update_output();
+        usleep(REALWORLD_DELAY);
+
+        // change I/O pins
+        iobus_set_value(data[k]);
+        iobus_update_output();
+        usleep(REALWORLD_DELAY); /* TODO: assure setup delay */
+
+//        printf("0x%02X ", data[k]);
+
+        // toggle nWE back high (acts as clock to latch the current address byte!)
+        controlbus_pin_set(PIN_nWE, ON);
+        controlbus_update_output();
+        usleep(REALWORLD_DELAY); /* TODO: assure hold delay */
+    }
+
+//    printf("\n");
+
+    return 0;
+}
+
 /**
  * Page Program
  *
+ * "The device is programmed by page.
+ * The number of consecutive partial page programming operation within the same page
+ * without an intervening erase operation must not exceed 8 times.
+ *
+ * The addressing should be done on each pages in a block.
+ * A page program cycle consists of a serial data loading period in which up to 2112 bytes of data
+ * may be loaded into the data register, followed by a non-volatile programming period where the loaded data
+ * is programmed into the appropriate cell.
+ *
+ * The serial data loading period begins by inputting the Serial Data Input command (80h),
+ * followed by the five cycle address inputs and then serial data.
+ *
+ * The bytes other than those to be programmed do not need to be loaded.
+ *
+ * The device supports random data input in a page.
+ * The column address of next data, which will be entered, may be changed to the address which follows
+ * random data input command (85h).
+ * Random data input may be operated multiple times regardless of how many times it is done in a page.
+ *
+ * The Page Program confirm command (10h) initiates the programming process.
+ * Writing 10h alone without pre-viously entering the serial data will not initiate the programming process.
+ * The internal write state controller automatically executes the algorithms and timings necessary for
+ * program and verify, thereby freeing the system controller for other tasks.
+ * Once the program process starts, the Read Status Register command may be entered to read the status register.
+ * The system controller can detect the completion of a program cycle by monitoring the R/B output,
+ * or the Status bit (I/O 6) of the Status Register.
+ * Only the Read Status command and Reset command are valid while programming is in progress.
+ *
+ * When the Page Program is complete, the Write Status Bit (I/O 0) may be checked.
+ * The internal write verify detects only errors for "1"s that are not successfully programmed to "0"s.
+ *
+ * The command register remains in Read Status command mode until another valid command is written to the
+ * command register.
  */
-void program_page(void)
+int program_page(unsigned int nPageId, unsigned char* data)
 {
+	uint32_t mem_address;
+    unsigned char addr_cylces[5];
+
+    mem_address = nPageId * PAGE_SIZE;
+
+	/* remove write protection */
+	controlbus_pin_set(PIN_nWP, ON);
+
+	printf("Writing data to memory address 0x%02X\n", mem_address);
+    get_address_cycle_map_x8(mem_address, addr_cylces);
+    printf("  Address cycles are: 0x%02X 0x%02X 0x%02X 0x%02X 0x%02X\n",
+        addr_cylces[0], addr_cylces[1], /* column address */
+        addr_cylces[2], addr_cylces[3], addr_cylces[4] ); /* row address */
+
+	printf("Latching first command byte to write a page (page size is %d)...\n",
+			PAGE_SIZE);
+	latch_command(CMD_PAGEPROGRAM[0]); /* Serial Data Input command */
+
+	printf("Latching address cycles...\n");
+    latch_address(addr_cylces, 5);
+
+	printf("Latching out the data of the page...\n");
+	latch_data_out(data, PAGE_SIZE);
+
+	printf("Latching second command byte to write a page...\n");
+	latch_command(CMD_PAGEPROGRAM[1]); /* Page Program confirm command command */
+
+	// busy-wait for high level at the busy line
+	printf("Checking for busy line...\n");
+	unsigned char controlbus_val;
+	do
+	{
+		controlbus_val = controlbus_read_input();
+		printf(".");
+	}
+	while( !(controlbus_val & PIN_RDY) );
+
+	printf("  done\n");
+
+
+	/* Read status */
+	printf("Latching command byte to read status...\n");
+	latch_command(CMD_READSTATUS);
+
+	unsigned char status_register;
+	latch_register(&status_register, 1); /* data output operation */
+
+	/* output the retrieved status register content */
+	printf("Status register content:   0x%02X\n", status_register);
+
+
+	/* activate write protection again */
+	controlbus_pin_set(PIN_nWP, OFF);
+
+
+	if(status_register & STATUSREG_IO0)
+	{
+		fprintf(stderr, "Failed to program page.\n");
+		return 1;
+	}
+	else
+	{
+		printf("Successfully programmed page.\n");
+		return 0;
+	}
 }
 
+void get_page_dummy_data(unsigned char* page_data)
+{
+	for(unsigned int k=0; k<PAGE_SIZE_NOSPARE; k++)
+	{
+		unsigned int m = k % 8;
+		switch( m )
+		{
+			case 0:
+			case 4:
+				page_data[k] = 0xDE;
+				break;
+			case 1:
+			case 5:
+				page_data[k] = 0xAD;
+				break;
+			case 2:
+			case 6:
+				page_data[k] = 0xBE;
+				break;
+			case 3:
+			case 7:
+				page_data[k] = 0xEF;
+				break;
+		}
+	}
+	for(unsigned int k=PAGE_SIZE_NOSPARE; k<PAGE_SIZE; k++)
+	{
+		page_data[k] = 0x11;
+	}
+}
 
 int main(int argc, char **argv)
 {
@@ -819,15 +980,28 @@ int main(int argc, char **argv)
         check_ID_register(ID_register);
     }
 
-    dump_memory();
-
-//	/* Erase all blocks */
+	/* Erase all blocks */
 //    for( unsigned int nBlockId = 0; nBlockId < 4096; nBlockId++ )
 //    {
 //    	erase_block(nBlockId);
 //    }
+    /* Erase block #0 */
+//	erase_block(0);
+//
+//	usleep(1* 1000000);
+//
+//	/* Write pages 0..9 with dummy data */
+//    unsigned char page_data[PAGE_SIZE];
+//    get_page_dummy_data(page_data);
+//
+//    for(unsigned int m=0; m<10; m++)
+//    {
+//		program_page(0, page_data);
+//		usleep(1* 1000000);
+//    }
 
-//    program_page();
+    /* Dump memory of the chip */
+    dump_memory();
 
 
     // set nCE high
